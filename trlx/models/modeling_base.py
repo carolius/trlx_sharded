@@ -274,7 +274,7 @@ class PreTrainedModelWrapper(nn.Module, transformers.utils.PushToHubMixin):
 
         if isinstance(pretrained_model_name_or_path, str):
             
-            m = transformers.AutoModel.from_pretrained(pretrained_model_name_or_path, revision=revision)                
+            m = transformers.AutoModel.from_pretrained(pretrained_model_name_or_path, revision=revision,attn_implementation="eager")                
             state_dict = m.state_dict()
 
         model.post_init(state_dict=state_dict)
