@@ -1591,6 +1591,51 @@ class T5Branch(ModelBranch):
             decoder_attentions=all_attentions,
         )
 class GemmaModelBranch(ModelBranch):
+    def __init__(
+        self,
+        base_model: transformers.PreTrainedModel,
+        *,
+        num_layers_unfrozen: int,
+        frozen=True,
+    ):
+        super().__init__(base_model, num_layers_unfrozen=num_layers_unfrozen, frozen=frozen)
+        self.dropout = hf_get_decoder(base_model).dropout
+        self.is_decoder = True
+
+    def _make_causal_mask(self, input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
+        """
+        Make causal mask used for bi-directional self-attention.
+        """
+        bsz, tgt_len = input_ids_shape
+        mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))
+        mask_cond = torch.arange(mask.size(-1))
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(dtype)
+
+        if past_key_values_length > 0:
+            mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
+        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, hidden_states, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = self._make_causal_mask(
+                input_shape, hidden_states.dtype, past_key_values_length=past_key_values_length
+            ).to(hidden_states.device)
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = torch.nn.functional.pad(attention_mask, (0, 0, 0, input_shape[-1] - attention_mask.shape[-1]))
+            expanded_attn_mask = expanded_attn_mask.unsqueeze(1).unsqueeze(2)
+            expanded_attn_mask = expanded_attn_mask.to(dtype=hidden_states.dtype)  # fp16 compatibility
+            expanded_attn_mask = (1.0 - expanded_attn_mask) * torch.finfo(hidden_states.dtype).min
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+        return combined_attention_mask
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1611,56 +1656,82 @@ class GemmaModelBranch(ModelBranch):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         batch_size, seq_length = hidden_states.shape[:2]
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
 
-        if past_key_values is None:
-            past_key_values = tuple([None] * len(self.decoder_blocks))
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
 
-        presents = () if use_cache else None
-        all_self_attentions = () if output_attentions else None
+        if position_ids is None:
+            device = hidden_states.device if hidden_states is not None else encoder_hidden_states.device
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
+
+        # embed positions
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+            )
+        attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
+        )
+
+        # decoder layers
         all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = () if use_cache else None
 
-        for i, (block, layer_past) in enumerate(zip(self.decoder_blocks, past_key_values)):
+        for idx, decoder_layer in enumerate(self.decoder_blocks):
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+                all_hidden_states += (hidden_states,)
 
-            outputs = block(
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+            layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=layer_past,
+                past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                cache_position=None,
             )
 
-            hidden_states = outputs[0]
+            hidden_states = layer_outputs[0]
 
             if use_cache:
-                presents = presents + (outputs[2 if output_attentions else 1],)
+                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:
-                all_self_attentions = all_self_attentions + (outputs[1],)
+                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.final_norm(hidden_states)
         hidden_states = hidden_states.view(output_shape)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
         lm_logits = self.lm_head(hidden_states)
 
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
-            return tuple(v for v in [lm_logits, hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+            outputs = (lm_logits,) + (None,) + (None,)
+            return outputs
 
         return CausalLMOutputWithValue(
             logits=lm_logits,
-            past_key_values=presents,
+            past_key_values=next_cache,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+            attentions=all_self_attns,
         )
+
 
 # Branch class utils
 
