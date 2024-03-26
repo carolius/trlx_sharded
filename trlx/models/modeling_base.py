@@ -273,44 +273,9 @@ class PreTrainedModelWrapper(nn.Module, transformers.utils.PushToHubMixin):
         model = cls(base_model, **wrapped_model_kwargs)
 
         if isinstance(pretrained_model_name_or_path, str):
-            filename = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
-            sharded_index_filename = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin.index.json")
-            is_sharded = False
-
-            if not os.path.exists(filename):
-                try:
-                    filename = hf_hub_download(pretrained_model_name_or_path, "pytorch_model.bin", revision=revision)
-                # Sharded
-                except Exception:
-                    if os.path.exists(sharded_index_filename):
-                        index_file_name = sharded_index_filename
-                    else:
-                        index_file_name = hf_hub_download(
-                            pretrained_model_name_or_path,
-                            "pytorch_model.bin.index.json",
-                            revision=revision,
-                        )
-                    with open(index_file_name, "r") as f:
-                        index = json.load(f)
-
-                    # Load all weights from the shards
-                    files_to_download = set(index["weight_map"].values())
-                    is_sharded = True
-
-            if is_sharded:
-                # Merge each shard into a state dict
-                # TODO: Optimize this to avoid wasting RAM
-                state_dict = {}
-                for shard_file in files_to_download:
-                    filename = os.path.join(pretrained_model_name_or_path, shard_file)
-                    # Download if shard file doesn't exist locally
-                    if not os.path.exists(filename):
-                        filename = hf_hub_download(pretrained_model_name_or_path, shard_file, revision=revision)
-                    state_dict.update(torch.load(filename, map_location="cpu"))
-            else:
-                state_dict = torch.load(filename, map_location="cpu")
-        else:
-            state_dict = pretrained_model_name_or_path.state_dict()
+            
+            m = transformers.AutoModel.from_pretrained(pretrained_model_name_or_path, revision=revision)                
+            state_dict = m.state_dict()
 
         model.post_init(state_dict=state_dict)
 
