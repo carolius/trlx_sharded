@@ -1590,7 +1590,77 @@ class T5Branch(ModelBranch):
             decoder_hidden_states=all_hidden_states,
             decoder_attentions=all_attentions,
         )
+class GemmaModelBranch(ModelBranch):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_shape: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
+    ) -> Union[Tuple, CausalLMOutputWithValue]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.decoder_blocks))
+
+        presents = () if use_cache else None
+        all_self_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        for i, (block, layer_past) in enumerate(zip(self.decoder_blocks, past_key_values)):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            outputs = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=layer_past,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=None,
+            )
+
+            hidden_states = outputs[0]
+
+            if use_cache:
+                presents = presents + (outputs[2 if output_attentions else 1],)
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (outputs[1],)
+
+        hidden_states = self.final_norm(hidden_states)
+        hidden_states = hidden_states.view(output_shape)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        lm_logits = self.lm_head(hidden_states)
+
+        if not return_dict:
+            return tuple(v for v in [lm_logits, hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+
+        return CausalLMOutputWithValue(
+            logits=lm_logits,
+            past_key_values=presents,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
 
 # Branch class utils
 
@@ -1609,6 +1679,7 @@ def hf_get_branch_class(
     bloom_branch_supported_archs = ["BloomModel", "BloomForCausalLM"]
     llama_branch_supported_archs = ["LlamaModel", "LlamaForCausalLM"]
     bigcode_branch_supported_archs = ["GPTBigCodeModel", "GPTBigCodeForCausalLM"]
+    gemma_branch_supported_archs = ["GemmaModel", "GemmaForCausalLM"]
     arch = config.architectures[0]
     if arch in gpt_branch_supported_archs:
         return GPTModelBranch
@@ -1620,6 +1691,8 @@ def hf_get_branch_class(
         return LlamaModelBranch
     elif arch in bigcode_branch_supported_archs:
         return GPTBigCodeModelBranch
+    elif arch in gemma_branch_supported_archs:
+        return GemmaModelBranch
     else:
         all_supported_archs = sum(
             [
@@ -1628,6 +1701,7 @@ def hf_get_branch_class(
                 bloom_branch_supported_archs,
                 llama_branch_supported_archs,
                 bigcode_branch_supported_archs,
+
             ],
             [],
         )
