@@ -13,6 +13,7 @@ from torchtyping import TensorType
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.bloom import modeling_bloom
 from transformers.models.opt import modeling_opt
+from transformers import GemmaModel
 
 from trlx.data.method_configs import MethodConfig, register_method
 from trlx.models.modeling_base import PreTrainedModelWrapper
@@ -1593,144 +1594,77 @@ class T5Branch(ModelBranch):
 class GemmaModelBranch(ModelBranch):
     def __init__(
         self,
-        base_model: transformers.PreTrainedModel,
+        base_model: GemmaModel,
         *,
         num_layers_unfrozen: int,
         frozen=True,
     ):
-        super().__init__(base_model, num_layers_unfrozen=num_layers_unfrozen, frozen=frozen)
-        self.dropout = hf_get_decoder(base_model).dropout
-        self.is_decoder = True
-
-    def _make_causal_mask(self, input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
         """
-        Make causal mask used for bi-directional self-attention.
+        Initializes a branch of the Gemma model consisting of the last `num_layers_unfrozen` layers.
+
+        Args:
+            base_model (GemmaModel): The Gemma pretrained model to branch from.
+            num_layers_unfrozen (int): Number of decoder layers from the end of the model to keep in the branch.
+            frozen (bool, optional): Whether to freeze the parameters of the branched model. Defaults to True.
         """
-        bsz, tgt_len = input_ids_shape
-        mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))
-        mask_cond = torch.arange(mask.size(-1))
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        mask = mask.to(dtype)
+        super().__init__()
+        self.frozen = frozen
+        
+        # Extracting the specified number of layers from the end of the model's decoder stack.
+        self.decoder_blocks = nn.ModuleList(deepcopy(base_model.model.layers[-num_layers_unfrozen:]))
+        
+        # Assuming GemmaModel follows the standard pattern of having a final layer normalization
+        # and an LM head following the Transformer layers.
+        self.final_norm = deepcopy(base_model.model.norm)
+        self.lm_head = deepcopy(base_model.lm_head)
 
-        if past_key_values_length > 0:
-            mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
-        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+        if self.frozen:
+            self.freeze_parameters()
 
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, hidden_states, past_key_values_length):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = self._make_causal_mask(
-                input_shape, hidden_states.dtype, past_key_values_length=past_key_values_length
-            ).to(hidden_states.device)
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = torch.nn.functional.pad(attention_mask, (0, 0, 0, input_shape[-1] - attention_mask.shape[-1]))
-            expanded_attn_mask = expanded_attn_mask.unsqueeze(1).unsqueeze(2)
-            expanded_attn_mask = expanded_attn_mask.to(dtype=hidden_states.dtype)  # fp16 compatibility
-            expanded_attn_mask = (1.0 - expanded_attn_mask) * torch.finfo(hidden_states.dtype).min
-            combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
-            )
-        return combined_attention_mask
+    def freeze_parameters(self):
+        """
+        Freezes all parameters of this branch to prevent them from being updated during training.
+        """
+        for param in self.parameters():
+            param.requires_grad = False
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        output_shape: torch.Tensor,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        input_ids: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = False,
-    ) -> Union[Tuple, CausalLMOutputWithValue]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Forward pass through the model branch.
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        batch_size, seq_length = hidden_states.shape[:2]
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-
-        if position_ids is None:
-            device = hidden_states.device if hidden_states is not None else encoder_hidden_states.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
-
-        # embed positions
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
-            )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
-        )
-
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
-
-        for idx, decoder_layer in enumerate(self.decoder_blocks):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            layer_outputs = decoder_layer(
-                hidden_states,
+        Args:
+            input_ids (torch.Tensor): Indices of input sequence tokens in the vocabulary.
+            attention_mask (Optional[torch.Tensor]): Mask to avoid performing attention on padding token indices.
+            position_ids (Optional[torch.Tensor]): Indices of positions of each input sequence tokens.
+            inputs_embeds (Optional[torch.Tensor]): Optionally, instead of passing `input_ids` you can choose to
+            directly pass an embedded representation.
+        
+        Returns:
+            The logits from the LM head.
+        """
+        # Delegating to the base model's `forward` method but only through the specified decoder blocks.
+        output = input_ids
+        for block in self.decoder_blocks:
+            output = block(
+                output,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )[0]
 
-            hidden_states = layer_outputs[0]
+        # Applying the final normalization and the LM head.
+        output = self.final_norm(output)
+        logits = self.lm_head(output)
 
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.final_norm(hidden_states)
-        hidden_states = hidden_states.view(output_shape)
-        lm_logits = self.lm_head(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        next_cache = next_decoder_cache if use_cache else None
-        if not return_dict:
-            outputs = (lm_logits,) + (None,) + (None,)
-            return outputs
-
-        return CausalLMOutputWithValue(
-            logits=lm_logits,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
+        return logits
 
 
 # Branch class utils
