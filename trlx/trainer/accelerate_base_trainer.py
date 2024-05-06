@@ -310,6 +310,9 @@ class AccelerateRLTrainer(BaseRLTrainer):
         """Creates a checkpoint for the optimizer, scheduler and the model"""
         dst_dir = directory or self.config.train.checkpoint_dir
         
+        # Create the checkpoint directory if it doesn't exist
+        os.makedirs(dst_dir, exist_ok=True)
+        
         # Save the model using save_model from safetensors
         save_model(self.model, os.path.join(dst_dir, "model.safetensors"), metadata={"format": "pt"})
         
