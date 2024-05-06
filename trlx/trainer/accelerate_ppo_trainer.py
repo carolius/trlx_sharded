@@ -316,7 +316,7 @@ class AcceleratePPOTrainer(AccelerateRLTrainer):
                     **metadata,
                 )
                 all_scores = [
-                    torch.tensor(score, dtype=torch.float, device=device).view(
+                    torch.as_tensor(score, dtype=torch.float, device=device).view(
                         -1,
                     )
                     for score in all_scores
