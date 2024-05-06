@@ -457,19 +457,22 @@ class AutoModelForCausalLMWithHydraValueHead(AutoModelForCausalLMWithValueHead):
         Returns the state dictionary of the model. We add the state dictionary of the value head
         to the state dictionary of the wrapped model by prepending the key with `v_head.`.
         """
-        state_dict = self.v_head.state_dict(*args, **dict(prefix="v_head.", **kwargs))
+        state_dict = {}
+        
         if not heads_only:
-            state_dict = {
-                **state_dict,
-                **self.base_model.state_dict(*args, **dict(prefix="" if self.peft_type else "base_model.", **kwargs)),
-            }
-
+            base_prefix = "" if self.peft_type else "base_model."
+            state_dict = self.base_model.state_dict(*args, **kwargs)
+            state_dict = {base_prefix + k: v for k, v in state_dict.items()}
+            
             if self.frozen_head:
-                state_dict = {
-                    **state_dict,
-                    **self.frozen_head.state_dict(*args, **dict(prefix="frozen_head.", **kwargs)),
-                }
-
+                frozen_head_state_dict = self.frozen_head.state_dict(*args, **kwargs)
+                for key, value in frozen_head_state_dict.items():
+                    state_dict[f"frozen_head.{key}"] = value
+        
+        v_head_state_dict = self.v_head.state_dict(*args, **kwargs)
+        for key, value in v_head_state_dict.items():
+            state_dict[f"v_head.{key}"] = value
+        
         return state_dict
 
     def post_init(self, state_dict):
