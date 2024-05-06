@@ -14,7 +14,7 @@ from ray.air import session
 from rich.console import Console
 from rich.table import Table
 from transformers import AutoTokenizer
-
+from safetensors.torch import save_model
 import trlx.utils.logging as logging
 from trlx.data.configs import TRLConfig
 from trlx.pipeline import MiniBatchIterator
@@ -309,8 +309,14 @@ class AccelerateRLTrainer(BaseRLTrainer):
     def save(self, directory: Optional[str] = None, **kwargs):
         """Creates a checkpoint for the optimizer, scheduler and the model"""
         dst_dir = directory or self.config.train.checkpoint_dir
-        self.accelerator.save_state(dst_dir, **kwargs)
-
+        
+        # Save the model using save_model from safetensors
+        save_model(self.model, os.path.join(dst_dir, "model.safetensors"), metadata={"format": "pt"})
+        
+        # Save the optimizer and scheduler states
+        torch.save(self.opt.state_dict(), os.path.join(dst_dir, "optimizer.pt"))
+        torch.save(self.scheduler.state_dict(), os.path.join(dst_dir, "scheduler.pt"))
+        
         if self.config.model.peft_config is not None and self.accelerator.is_main_process:
             # Remove "pytorch_model.bin" because it contains more than necessary,
             # let save_pretrained recreate it with just the value heads.
