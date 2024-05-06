@@ -215,11 +215,7 @@ class PreTrainedModelWrapper(nn.Module, transformers.utils.PushToHubMixin):
                         pretrained_model_name_or_path, *model_args, **from_pretrained_kwargs
                     )
 
-                    if is_loaded_in_8bit:
-                        base_model = prepare_model_for_int8_training(
-                            base_model,
-                            **peft_int8_kwargs,
-                        )
+                    
                     base_model = get_peft_model(base_model, peft_config)
                     logger.info("peft adapter initialised")
 
@@ -253,11 +249,7 @@ class PreTrainedModelWrapper(nn.Module, transformers.utils.PushToHubMixin):
             base_model = pretrained_model_name_or_path
 
             if peft_config is not None:
-                if is_loaded_in_8bit:
-                    base_model = prepare_model_for_int8_training(
-                        base_model,
-                        **peft_int8_kwargs,
-                    )
+                
                 base_model = get_peft_model(base_model, peft_config)
                 logger.info("peft adapter initialised")
         else:
