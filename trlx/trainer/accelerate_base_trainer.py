@@ -256,17 +256,33 @@ class AccelerateRLTrainer(BaseRLTrainer):
     def generate(self, input_ids, attention_mask=None, **kwargs):
         """Generate samples for the experience buffer using method's specific `self.generate_experience_kwargs`"""
         input_ids = input_ids.to(self.accelerator.device)
+
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.accelerator.device)
+
         if self.generate_experience_kwargs is not None:
             kwargs = dict(self.generate_experience_kwargs, **kwargs)
         else:
             kwargs = dict(self.generate_kwargs, **kwargs)
 
         with torch.no_grad():
-            return self.accelerator.unwrap_model(self.model).generate(
+            tokens = self.accelerator.unwrap_model(self.model).generate(
                 input_ids=input_ids, attention_mask=attention_mask, **kwargs
             )
+
+            # Get the logits for the generated tokens
+            logits = self.model.lm_head(tokens)
+
+            # Normalize the logits to get probabilities
+            probs = F.softmax(logits, dim=-1)
+
+            # Clip the probabilities to a valid range
+            probs = torch.clamp(probs, min=1e-8, max=1.0)
+
+            # Sample the next tokens using the modified probabilities
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+        return tokens
 
     def generate_eval(self, input_ids, attention_mask=None, **kwargs):
         """Generate samples for evaluation using `self.generate_kwargs`"""
